@@ -1,0 +1,2 @@
+{"id": "NQ_1", "dataset": "nq", "split": "dev", "question": "Who wrote the novel Dune?", "answers": ["Frank Herbert"]}
+{"id": "NQ_2", "dataset": "nq", "split": "dev", "question": "What is the capital of France?", "answers": ["Paris"]}
