@@ -1,84 +1,89 @@
-from __future__ import annotations
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
 class HFGeneratorBackend:
     """
-    Wrapper HF LLM:
-      - compute_logprob(prompt, answer)
-      - generate(prompt)
+    Wrapper đơn giản quanh HF causal LM để:
+      - load model lớn (Mistral-7B, LLaMA, ...)
+      - cung cấp hàm generate(prompt, ...) trả về text.
+
+    Dùng được cho cả tiny-gpt2 lẫn mistralai/Mistral-7B-Instruct-v0.2.
     """
+
     def __init__(
         self,
         model_name: str,
         device: str = "cuda",
         max_length: int = 512,
-        load_in_4bit: bool = False,
-        **gen_kwargs,
+        torch_dtype=torch.float16,
     ):
         self.model_name = model_name
         self.device = device
         self.max_length = max_length
-        self.gen_kwargs = gen_kwargs
 
+        # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        if load_in_4bit:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map="auto",
-                load_in_4bit=True,
-                torch_dtype=torch.float16,
-            )
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map="auto",
-                torch_dtype=torch.float16,
-            )
+        # Load model (kiểu "an toàn VRAM" giống script teacher)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch_dtype,
+            device_map="auto",        # để HF tự map sang GPU
+            low_cpu_mem_usage=True,
+        )
         self.model.eval()
 
+        # gen_kwargs mặc định (sẽ được update bởi arg truyền vào generate)
+        self.gen_kwargs = {
+            "do_sample": False,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "pad_token_id": self.tokenizer.eos_token_id,
+        }
+
     @torch.no_grad()
-    def compute_logprob(self, prompt: str, answer: str) -> float:
-        full = prompt + " " + answer
-        inputs = self.tokenizer(full, return_tensors="pt",
-                                truncation=True, max_length=self.max_length)
-        prompt_ids = self.tokenizer(prompt, return_tensors="pt",
-                                    truncation=True, max_length=self.max_length)["input_ids"]
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 64,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        do_sample: bool | None = None,
+    ) -> str:
+        """
+        Sinh 1 câu trả lời text từ prompt.
+        Các tham số temperature/top_p/do_sample nếu truyền vào sẽ override self.gen_kwargs.
+        """
+        # Cập nhật gen_kwargs local
+        gen_kwargs = dict(self.gen_kwargs)
+        if temperature is not None:
+            gen_kwargs["temperature"] = temperature
+            # nếu temperature > 0 thì mặc định bật sampling
+            if temperature > 0:
+                gen_kwargs["do_sample"] = True
+        if top_p is not None:
+            gen_kwargs["top_p"] = top_p
+        if do_sample is not None:
+            gen_kwargs["do_sample"] = do_sample
 
-        input_ids = inputs["input_ids"].to(self.device)
-        attention_mask = inputs["attention_mask"].to(self.device)
-        prompt_len = prompt_ids.shape[1]
-
-        labels = input_ids.clone()
-        labels[:, :prompt_len] = -100
-
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
+        # Tokenize
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.max_length,
         )
-        loss = outputs.loss
-        n_answer_tokens = (labels != -100).sum()
-        if n_answer_tokens.item() == 0:
-            return float("nan")
-        logp = -loss.item() * n_answer_tokens.item()
-        return float(logp)
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
-    @torch.no_grad()
-    def generate(self, prompt: str, max_new_tokens: int = 64, temperature: float = 0.7, top_p: float = 0.9, do_sample: bool = True) -> str:
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        outputs = self.model.generate(
+        # Generate
+        output_ids = self.model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            do_sample=do_sample,
-            pad_token_id=self.tokenizer.eos_token_id,
-            **self.gen_kwargs,
+            **gen_kwargs,
         )
-        text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        return text[len(prompt):]
+
+        # Bỏ phần input, chỉ lấy phần mới sinh
+        gen_tokens = output_ids[0, inputs["input_ids"].shape[1] :]
+        text = self.tokenizer.decode(gen_tokens, skip_special_tokens=True)
+        return text.strip()
