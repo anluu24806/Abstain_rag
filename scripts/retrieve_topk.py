@@ -6,6 +6,7 @@ from typing import List, Dict, Tuple
 import torch
 from transformers import AutoTokenizer, AutoModel
 
+
 def load_queries(path: str) -> List[Dict]:
     data = []
     with open(path, encoding="utf-8") as f:
@@ -15,6 +16,7 @@ def load_queries(path: str) -> List[Dict]:
                 continue
             data.append(json.loads(line))
     return data
+
 
 def load_corpus(path: str) -> List[Dict]:
     corpus = []
@@ -26,18 +28,24 @@ def load_corpus(path: str) -> List[Dict]:
             corpus.append(json.loads(line))
     return corpus
 
-def encode_queries(model_name: str,
-                   questions: List[str],
-                   batch_size: int = 32,
-                   device: str = "cuda") -> torch.Tensor:
+
+def encode_queries(
+    model_name: str,
+    questions: List[str],
+    batch_size: int = 32,
+    device: str = "cuda",
+) -> torch.Tensor:
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name).to(device)
     model.eval()
 
+    N = len(questions)
+    print(f"[encode_queries] Encoding {N} queries with batch_size={batch_size} on {device} ...")
+
     all_embeds = []
     with torch.no_grad():
-        for i in range(0, len(questions), batch_size):
-            chunk = questions[i:i+batch_size]
+        for batch_idx in range(0, N, batch_size):
+            chunk = questions[batch_idx:batch_idx + batch_size]
             enc = tokenizer(
                 chunk,
                 padding=True,
@@ -49,7 +57,15 @@ def encode_queries(model_name: str,
             embeds = out.last_hidden_state.mean(dim=1)
             embeds = torch.nn.functional.normalize(embeds, p=2, dim=1)
             all_embeds.append(embeds.cpu())
+
+            # progress
+            end = min(batch_idx + batch_size, N)
+            if (batch_idx // batch_size) % 50 == 0 or end == N:
+                pct = end / N * 100
+                print(f"[encode_queries] Encoded {end}/{N} queries ({pct:.2f}%)")
+
     return torch.cat(all_embeds, dim=0)  # [N, D]
+
 
 def retrieve_topk(
     q_embeds: torch.Tensor,
@@ -62,30 +78,41 @@ def retrieve_topk(
     q_embeds: [Nq, D]
     index_obj: {"embeds": [Nd, D], "doc_ids": list}
     return:
-      scores: [Nq, k_eff]
+      scores:  [Nq, k_eff]
       indices: [Nq, k_eff]  (k_eff = min(k, Nd))
     """
     doc_embeds = index_obj["embeds"].to(device)  # [Nd, D]
     q_embeds = q_embeds.to(device)
+
     Nd = doc_embeds.size(0)
+    Nq = q_embeds.size(0)
     k_eff = min(k, Nd)
     if k_eff < k:
         print(f"[retrieve_topk] Requested k={k} > Nd={Nd}. Using k_eff={k_eff} instead.")
+
+    print(f"[retrieve_topk] Retrieving top-{k_eff} for {Nq} queries against Nd={Nd} docs ...")
 
     all_scores = []
     all_indices = []
 
     with torch.no_grad():
-        for i in range(0, q_embeds.size(0), batch_size):
-            qs = q_embeds[i:i+batch_size]  # [B, D]
-            scores = torch.matmul(qs, doc_embeds.t())  # [B, Nd]
+        for batch_idx in range(0, Nq, batch_size):
+            qs = q_embeds[batch_idx:batch_idx + batch_size]  # [B, D]
+            scores = torch.matmul(qs, doc_embeds.t())        # [B, Nd]
             top_scores, top_idx = torch.topk(scores, k_eff, dim=-1)
             all_scores.append(top_scores.cpu())
             all_indices.append(top_idx.cpu())
 
+            # progress
+            end = min(batch_idx + batch_size, Nq)
+            if (batch_idx // batch_size) % 50 == 0 or end == Nq:
+                pct = end / Nq * 100
+                print(f"[retrieve_topk] Processed {end}/{Nq} queries ({pct:.2f}%)")
+
     scores = torch.cat(all_scores, dim=0)   # [Nq, k_eff]
     indices = torch.cat(all_indices, dim=0) # [Nq, k_eff]
     return scores, indices
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -129,8 +156,11 @@ def main():
     )
 
     os.makedirs(os.path.dirname(args.out_path), exist_ok=True)
+    Nq = len(queries)
+    print(f"[write_results] Writing results for {Nq} queries to {args.out_path} ...")
+
     with open(args.out_path, "w", encoding="utf-8") as fout:
-        for ex, sc, idxs in zip(queries, scores, indices):
+        for i, (ex, sc, idxs) in enumerate(zip(queries, scores, indices)):
             retrieved = []
             for rank, (s, ix) in enumerate(zip(sc.tolist(), idxs.tolist()), start=1):
                 doc_id = index_obj["doc_ids"][ix]
@@ -148,7 +178,12 @@ def main():
             }
             fout.write(json.dumps(out_ex, ensure_ascii=False) + "\n")
 
+            if (i + 1) % 1000 == 0 or (i + 1) == Nq:
+                pct = (i + 1) / Nq * 100
+                print(f"[write_results] Wrote {i+1}/{Nq} queries ({pct:.2f}%)")
+
     print(f"Saved retrieval results to {args.out_path}")
+
 
 if __name__ == "__main__":
     main()
